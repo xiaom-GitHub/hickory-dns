@@ -6,6 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU8;
@@ -452,39 +453,45 @@ impl<P: ConnectionProvider> PoolState<P> {
     }
 }
 
-/// Compare two errors to see if one contains a server response.
+/// Compare two errors and return the more specific one, preserving `previous` on ties.
 fn most_specific(previous: NetError, current: NetError) -> NetError {
-    match (&previous, &current) {
-        (NetError::NoConnections, NetError::ConnectionClosed) => return current,
-        (NetError::ConnectionClosed, NetError::NoConnections) => return previous,
-        _ => (),
+    #[derive(Eq, PartialEq, Ord, PartialOrd)]
+    enum ErrorRank {
+        NoConnections,
+        Busy,
+        Other,
+        Timeout,
+        Transport,
+        ResponseError,
+        ResponseCode,
+        NoRecordsFound,
+        Dnssec,
     }
 
-    match (&previous, &current) {
-        (
-            NetError::Dns(DnsError::NoRecordsFound { .. }),
-            NetError::Dns(DnsError::NoRecordsFound { .. }),
-        ) => return previous,
-        (NetError::Dns(DnsError::NoRecordsFound { .. }), _) => return previous,
-        (_, NetError::Dns(DnsError::NoRecordsFound { .. })) => return current,
-        _ => (),
+    fn rank(err: &NetError) -> ErrorRank {
+        match err {
+            NetError::NoConnections => ErrorRank::NoConnections,
+            NetError::Busy => ErrorRank::Busy,
+            NetError::Timeout => ErrorRank::Timeout,
+            NetError::Io(io) if io.kind() == io::ErrorKind::TimedOut => ErrorRank::Timeout,
+            err if err.is_transport_error() => ErrorRank::Transport,
+            NetError::ForeignClassRecord { .. }
+            | NetError::QueryCaseMismatch
+            | NetError::Truncated => ErrorRank::ResponseError,
+            NetError::Dns(DnsError::ResponseCode(_)) => ErrorRank::ResponseCode,
+            NetError::Dns(DnsError::NoRecordsFound(_)) => ErrorRank::NoRecordsFound,
+            NetError::Dns(DnsError::DnssecBogus) => ErrorRank::Dnssec,
+            #[cfg(feature = "__dnssec")]
+            NetError::Dns(DnsError::Nsec { .. }) => ErrorRank::Dnssec,
+            _ => ErrorRank::Other,
+        }
     }
 
-    match (&previous, &current) {
-        (NetError::Io { .. }, NetError::Io { .. }) => return previous,
-        (NetError::Io { .. }, _) => return current,
-        (_, NetError::Io { .. }) => return previous,
-        _ => (),
+    if rank(&current) > rank(&previous) {
+        current
+    } else {
+        previous
     }
-
-    match (&previous, &current) {
-        (NetError::Timeout, NetError::Timeout) => return previous,
-        (NetError::Timeout, _) => return previous,
-        (_, NetError::Timeout) => return current,
-        _ => (),
-    }
-
-    previous
 }
 
 /// Sorts servers by their decayed SRTT for query-statistics-based ordering.
@@ -1081,7 +1088,6 @@ impl Future for SharedLookup {
 mod tests {
     use std::collections::HashSet;
     use std::future::Future;
-    use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
     use std::str::FromStr;
@@ -2654,5 +2660,115 @@ mod tests {
             total_queries <= 3,
             "total queries across all servers should be bounded, got {total_queries}"
         );
+    }
+
+    #[test]
+    fn test_most_specific() {
+        let query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::A);
+        let nxdomain = || NetError::from(NoRecords::new(query.clone(), ResponseCode::NXDomain));
+        let servfail = || NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail));
+        let refused = || NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused));
+        let io_err = || NetError::from(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let raw_io_timeout = || NetError::Io(Arc::new(io::Error::from(io::ErrorKind::TimedOut)));
+        let message_err = || NetError::from("generic error");
+
+        assert!(matches!(
+            most_specific(nxdomain(), NetError::Dns(DnsError::DnssecBogus)),
+            NetError::Dns(DnsError::DnssecBogus)
+        ));
+        assert!(matches!(
+            most_specific(servfail(), nxdomain()),
+            NetError::Dns(DnsError::NoRecordsFound(_))
+        ));
+        assert!(matches!(
+            most_specific(nxdomain(), servfail()),
+            NetError::Dns(DnsError::NoRecordsFound(_))
+        ));
+        assert!(matches!(
+            most_specific(NetError::Truncated, servfail()),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+        ));
+        assert!(matches!(
+            most_specific(io_err(), servfail()),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+        ));
+        assert!(matches!(
+            most_specific(NetError::Timeout, servfail()),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+        ));
+        assert!(matches!(
+            most_specific(NetError::NoConnections, servfail()),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+        ));
+        assert!(matches!(
+            most_specific(io_err(), NetError::Truncated),
+            NetError::Truncated
+        ));
+        assert!(matches!(
+            most_specific(NetError::QueryCaseMismatch, NetError::Timeout),
+            NetError::QueryCaseMismatch
+        ));
+        assert!(matches!(
+            most_specific(NetError::Timeout, io_err()),
+            NetError::Io(_)
+        ));
+        assert!(matches!(
+            most_specific(io_err(), NetError::Timeout),
+            NetError::Io(_)
+        ));
+        assert!(matches!(
+            most_specific(raw_io_timeout(), io_err()),
+            NetError::Io(ref err) if err.kind() == io::ErrorKind::ConnectionRefused
+        ));
+        assert!(matches!(
+            most_specific(NetError::NoConnections, io_err()),
+            NetError::Io(_)
+        ));
+        assert!(matches!(
+            most_specific(io_err(), NetError::NoConnections),
+            NetError::Io(_)
+        ));
+        assert!(matches!(
+            most_specific(NetError::NoConnections, NetError::ConnectionClosed),
+            NetError::ConnectionClosed
+        ));
+        assert!(matches!(
+            most_specific(NetError::ConnectionClosed, NetError::NoConnections),
+            NetError::ConnectionClosed
+        ));
+        assert!(matches!(
+            most_specific(NetError::Timeout, NetError::ConnectionClosed),
+            NetError::ConnectionClosed
+        ));
+        assert!(matches!(
+            most_specific(message_err(), NetError::Timeout),
+            NetError::Timeout
+        ));
+        assert!(matches!(
+            most_specific(NetError::Busy, message_err()),
+            NetError::Message(_)
+        ));
+        assert!(matches!(
+            most_specific(NetError::Busy, NetError::Timeout),
+            NetError::Timeout
+        ));
+        assert!(matches!(
+            most_specific(NetError::NoConnections, NetError::Busy),
+            NetError::Busy
+        ));
+
+        // Ties preserve `previous`.
+        assert!(matches!(
+            most_specific(servfail(), refused()),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+        ));
+        assert!(matches!(
+            most_specific(io_err(), NetError::ConnectionClosed),
+            NetError::Io(_)
+        ));
+        assert!(matches!(
+            most_specific(NetError::Timeout, raw_io_timeout()),
+            NetError::Timeout
+        ));
     }
 }
