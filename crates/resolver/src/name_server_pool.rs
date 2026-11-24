@@ -435,7 +435,9 @@ impl<P: ConnectionProvider> PoolState<P> {
                     NetError::Busy => busy.push(server),
                     // If the connection failed or timed out, try another one.
                     error if error.is_transport_error() => {}
-                    NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)) => {}
+                    // Retry remaining servers on error response codes regardless of
+                    // `trust_negative_responses`.
+                    NetError::Dns(DnsError::ResponseCode(_)) => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
                     // don't trust, we should try another server.
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
@@ -2983,5 +2985,156 @@ mod tests {
             "expected Timeout when unattempted servers remain, got {err:?}"
         );
         assert!(provider.queries(&unreached_ip).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pool_retries_on_error_response_codes() {
+        subscribe();
+
+        let bad_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let answer_ip = Ipv4Addr::new(93, 188, 44, 50);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        for code in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::FormErr,
+            ResponseCode::NotImp,
+            ResponseCode::NotAuth,
+            ResponseCode::BADSIG,
+            ResponseCode::BADMODE,
+            ResponseCode::BADCOOKIE,
+        ] {
+            for trust_negative_responses in [true, false] {
+                for num_concurrent_reqs in [1, 2] {
+                    let handler = MockNetworkHandler::new(
+                        [bad_ip, good_ip]
+                            .map(|ip| {
+                                MockResponse::new(ip, &query_name, RecordType::A)
+                                    .a(&query_name, answer_ip)
+                            })
+                            .to_vec(),
+                    )
+                    .with_mutation(Box::new(move |ip, _, message| {
+                        if ip == bad_ip {
+                            message.answers.clear();
+                            message.metadata.response_code = code;
+                            if code.high() != 0 {
+                                message.edns.get_or_insert_default();
+                            }
+                        }
+                    }));
+                    let provider = MockProvider::new(handler);
+                    let opts = ResolverOpts {
+                        num_concurrent_reqs,
+                        server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+                        ..ResolverOpts::default()
+                    };
+                    let servers = [bad_ip, good_ip]
+                        .into_iter()
+                        .map(|ip| {
+                            let mut cfg = NameServerConfig::udp(ip);
+                            cfg.trust_negative_responses = trust_negative_responses;
+                            // Delay good_ip in parallel mode so bad_ip responds first.
+                            let delay = if ip == good_ip && num_concurrent_reqs > 1 {
+                                Duration::from_millis(20)
+                            } else {
+                                Duration::ZERO
+                            };
+                            Arc::new(NameServer::new(
+                                [],
+                                cfg,
+                                &opts,
+                                DelayedBindProvider::new(provider.clone(), delay),
+                            ))
+                        })
+                        .collect();
+                    let pool = NameServerPool::from_nameservers(
+                        servers,
+                        Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+                    );
+
+                    let response = pool
+                        .lookup(
+                            Query::new(query_name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        )
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "expected fallback on {code:?}                                  (trust_negative_responses={trust_negative_responses},                                  num_concurrent_reqs={num_concurrent_reqs}): {e}"
+                            )
+                        });
+                    assert_eq!(response.answers.len(), 1);
+                    assert_eq!(response.answers[0].data, RData::A(A(answer_ip)));
+                    assert!(!provider.queries(&bad_ip).is_empty());
+                    assert!(!provider.queries(&good_ip).is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_prefers_nxdomain_over_response_code() {
+        subscribe();
+
+        let refused_ip = IpAddr::from([10, 0, 0, 1]);
+        let nxdomain_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("missing.example.com.").unwrap();
+
+        for server_order in [[refused_ip, nxdomain_ip], [nxdomain_ip, refused_ip]] {
+            let handler = MockNetworkHandler::new(
+                server_order
+                    .map(|ip| MockResponse::new(ip, &query_name, RecordType::A))
+                    .to_vec(),
+            )
+            .with_mutation(Box::new(move |ip, _, message| {
+                message.answers.clear();
+                message.metadata.response_code = if ip == refused_ip {
+                    ResponseCode::Refused
+                } else {
+                    ResponseCode::NXDomain
+                };
+            }));
+            let provider = MockProvider::new(handler);
+            let opts = ResolverOpts {
+                num_concurrent_reqs: 1,
+                server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+                ..ResolverOpts::default()
+            };
+            let servers = server_order
+                .into_iter()
+                .map(|ip| {
+                    let mut cfg = NameServerConfig::udp(ip);
+                    cfg.trust_negative_responses = false;
+                    Arc::new(NameServer::new([], cfg, &opts, provider.clone()))
+                })
+                .collect();
+            let pool = NameServerPool::from_nameservers(
+                servers,
+                Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+            );
+
+            let err = pool
+                .lookup(
+                    Query::new(query_name.clone(), RecordType::A),
+                    DnsRequestOptions::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        response_code: ResponseCode::NXDomain,
+                        ..
+                    }))
+                ),
+                "expected NXDomain regardless of order, got {err:?}"
+            );
+            assert!(!provider.queries(&refused_ip).is_empty());
+            assert!(!provider.queries(&nxdomain_ip).is_empty());
+        }
     }
 }
