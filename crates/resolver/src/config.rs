@@ -209,10 +209,11 @@ impl ResolverConfig {
 pub struct NameServerConfig {
     /// The address which the DNS NameServer is registered at.
     pub ip: IpAddr,
-    /// Whether to trust `NXDOMAIN` responses from upstream nameservers.
+    /// Whether to trust negative (`NXDOMAIN` and `NODATA`) responses from upstream nameservers.
     ///
-    /// When this is `true`, and an empty `NXDOMAIN` response with an empty answers set is
-    /// received, the query will not be retried against other configured name servers.
+    /// When this is `true`, and a negative `NXDOMAIN` or `NOERROR` (`NODATA`) response (with an
+    /// empty answers section) is received, the query will not be retried against other configured
+    /// name servers.
     ///
     /// (On a response with any other error response code, the query will still be retried
     /// regardless of this configuration setting.)

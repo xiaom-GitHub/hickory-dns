@@ -438,10 +438,21 @@ impl<P: ConnectionProvider> PoolState<P> {
                     // Retry remaining servers on error response codes regardless of
                     // `trust_negative_responses`.
                     NetError::Dns(DnsError::ResponseCode(_)) => {}
-                    // If we got an `NXDomain` response from a server whose negative responses we
-                    // don't trust, we should try another server.
+                    // If we got a negative response (`NXDomain`, or `NODATA` -- empty `NoError`
+                    // excluding pure NS-only referrals) from a server whose negative responses
+                    // we don't trust, try another server.
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
                         response_code: ResponseCode::NXDomain,
+                        ..
+                    }))
+                    | NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        response_code: ResponseCode::NoError,
+                        soa: Some(_),
+                        ..
+                    }))
+                    | NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        response_code: ResponseCode::NoError,
+                        ns: None,
                         ..
                     })) if !server.trust_negative_responses() => {}
                     _ => return Err(e),
@@ -3136,5 +3147,176 @@ mod tests {
             assert!(!provider.queries(&refused_ip).is_empty());
             assert!(!provider.queries(&nxdomain_ip).is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_pool_nodata_and_authority_ns_failover() {
+        use crate::proto::rr::rdata::{NS, SOA};
+
+        subscribe();
+
+        let neg_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let answer_ip = Ipv4Addr::new(93, 188, 44, 50);
+        let query_name = Name::from_str("example.com.").unwrap();
+        let soa_record = || {
+            Record::from_rdata(
+                query_name.clone(),
+                60,
+                RData::SOA(SOA::new(
+                    Name::from_str("ns1.example.com.").unwrap(),
+                    Name::from_str("hostmaster.example.com.").unwrap(),
+                    1,
+                    60,
+                    60,
+                    60,
+                    60,
+                )),
+            )
+        };
+        let ns_record = || {
+            Record::from_rdata(
+                query_name.clone(),
+                60,
+                RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+            )
+        };
+
+        // Bare NODATA, NODATA with SOA, NODATA with SOA+NS, and NXDOMAIN with NS all retry
+        // remaining servers when `trust_negative_responses` is false, and stop when true.
+        for (label, rcode, with_soa, with_ns) in [
+            ("bare_nodata", ResponseCode::NoError, false, false),
+            ("soa_nodata", ResponseCode::NoError, true, false),
+            ("soa_and_ns_nodata", ResponseCode::NoError, true, true),
+            ("ns_nxdomain", ResponseCode::NXDomain, true, true),
+        ] {
+            for trust_negative_responses in [true, false] {
+                for num_concurrent_reqs in [1, 2] {
+                    let soa = soa_record();
+                    let ns = ns_record();
+                    let handler = MockNetworkHandler::new(vec![
+                        MockResponse::new(neg_ip, &query_name, RecordType::A),
+                        MockResponse::new(good_ip, &query_name, RecordType::A)
+                            .a(&query_name, answer_ip),
+                    ])
+                    .with_mutation(Box::new(move |ip, _, message| {
+                        if ip == neg_ip {
+                            message.answers.clear();
+                            message.metadata.response_code = rcode;
+                            if with_soa {
+                                message.authorities.push(soa.clone());
+                            }
+                            if with_ns {
+                                message.authorities.push(ns.clone());
+                            }
+                        }
+                    }));
+                    let provider = MockProvider::new(handler);
+                    let opts = ResolverOpts {
+                        num_concurrent_reqs,
+                        server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+                        ..ResolverOpts::default()
+                    };
+                    let servers = [neg_ip, good_ip]
+                        .into_iter()
+                        .map(|ip| {
+                            let mut cfg = NameServerConfig::udp(ip);
+                            cfg.trust_negative_responses = trust_negative_responses;
+                            let delay = if ip == good_ip && num_concurrent_reqs > 1 {
+                                Duration::from_millis(20)
+                            } else {
+                                Duration::ZERO
+                            };
+                            Arc::new(NameServer::new(
+                                [],
+                                cfg,
+                                &opts,
+                                DelayedBindProvider::new(provider.clone(), delay),
+                            ))
+                        })
+                        .collect();
+                    let pool = NameServerPool::from_nameservers(
+                        servers,
+                        Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+                    );
+
+                    let result = pool
+                        .lookup(
+                            Query::new(query_name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        )
+                        .await;
+
+                    if trust_negative_responses {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                                    response_code,
+                                    ..
+                                }))) if response_code == rcode
+                            ),
+                            "{label} (conc={num_concurrent_reqs}): expected {rcode:?}, got {result:?}"
+                        );
+                        if num_concurrent_reqs == 1 {
+                            assert!(provider.queries(&good_ip).is_empty(), "{label}");
+                        }
+                    } else {
+                        let response = result.unwrap_or_else(|e| {
+                            panic!("{label} (conc={num_concurrent_reqs}) should fall back: {e}")
+                        });
+                        assert_eq!(response.answers[0].data, RData::A(A(answer_ip)));
+                        assert!(!provider.queries(&good_ip).is_empty(), "{label}");
+                    }
+                }
+            }
+        }
+
+        // Pure NS-only referral (`NoError` with `NS`, no `SOA`) is not a NODATA negative response
+        // and must return immediately even when `trust_negative_responses` is false.
+        let ns = ns_record();
+        let handler = MockNetworkHandler::new(vec![
+            MockResponse::new(neg_ip, &query_name, RecordType::A),
+            MockResponse::new(good_ip, &query_name, RecordType::A).a(&query_name, answer_ip),
+        ])
+        .with_mutation(Box::new(move |ip, _, message| {
+            if ip == neg_ip {
+                message.answers.clear();
+                message.authorities.push(ns.clone());
+            }
+        }));
+        let provider = MockProvider::new(handler);
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+        let mut ref_cfg = NameServerConfig::udp(neg_ip);
+        ref_cfg.trust_negative_responses = false;
+        let pool = NameServerPool::from_config(
+            [ref_cfg, NameServerConfig::udp(good_ip)],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+            provider.clone(),
+        );
+        let err = pool
+            .lookup(
+                Query::new(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                    response_code: ResponseCode::NoError,
+                    soa: None,
+                    ns: Some(_),
+                    ..
+                }))
+            ),
+            "expected referral NoRecordsFound, got {err:?}"
+        );
+        assert!(provider.queries(&good_ip).is_empty());
     }
 }
