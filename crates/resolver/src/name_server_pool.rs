@@ -335,11 +335,6 @@ impl<P: ConnectionProvider> PoolState<P> {
         let mut policy = ConnectionPolicy::default();
 
         loop {
-            // Check the deadline before starting a new round of server attempts.
-            if Instant::now() >= deadline {
-                return Err(NetError::Timeout);
-            }
-
             // construct the parallel requests, 2 is the default
             let mut par_servers = SmallVec::<[_; 2]>::new();
             while !servers.is_empty()
@@ -367,6 +362,11 @@ impl<P: ConnectionProvider> PoolState<P> {
                     continue;
                 }
                 return Err(err.unwrap_or(NetError::NoConnections));
+            }
+
+            // Check the deadline before starting a new round of server attempts.
+            if Instant::now() >= deadline {
+                return Err(NetError::Timeout);
             }
 
             // Track all servers in the parallel batch so we can penalize any
@@ -404,7 +404,9 @@ impl<P: ConnectionProvider> PoolState<P> {
                     Ok(response) if response.truncation => {
                         debug!("truncated response received, retrying over TCP");
                         policy.disable_udp = true;
-                        err = Some(NetError::Truncated);
+                        err = Some(err.map_or(NetError::Truncated, |previous| {
+                            most_specific(previous, NetError::Truncated)
+                        }));
                         servers.push_front(server);
                         continue;
                     }
@@ -428,7 +430,6 @@ impl<P: ConnectionProvider> PoolState<P> {
                     NetError::QueryCaseMismatch => {
                         servers.push_front(server);
                         policy.disable_udp = true;
-                        continue;
                     }
                     // If the server is busy, try it again later if necessary.
                     NetError::Busy => busy.push(server),
@@ -2770,5 +2771,217 @@ mod tests {
             most_specific(NetError::Timeout, raw_io_timeout()),
             NetError::Timeout
         ));
+    }
+
+    #[tokio::test]
+    async fn test_query_case_mismatch_preserved_on_udp_only_pool() {
+        subscribe();
+
+        let server_ip = IpAddr::from([10, 0, 0, 1]);
+        let query_name = Name::from_str("example.com.").unwrap();
+        let handler = MockNetworkHandler::new(vec![
+            MockResponse::new(server_ip, &query_name, RecordType::A)
+                .a(&query_name, Ipv4Addr::new(93, 188, 44, 50)),
+        ])
+        .with_mutation(Box::new(|_, _, message| {
+            let flipped: String = message.queries[0]
+                .name
+                .to_ascii()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            message.queries[0].name = Name::from_str(&flipped).unwrap();
+        }));
+        let provider = MockProvider::new(handler);
+        let opts = ResolverOpts {
+            case_randomization: true,
+            ..ResolverOpts::default()
+        };
+        let pool = NameServerPool::from_config(
+            [NameServerConfig::udp(server_ip)],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+            provider,
+        );
+
+        let err = pool
+            .lookup(
+                Query::new(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, NetError::QueryCaseMismatch),
+            "expected QueryCaseMismatch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_udp_preserves_prior_servfail() {
+        subscribe();
+
+        let servfail_ip = IpAddr::from([10, 0, 0, 1]);
+        let trunc_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+        let handler = MockNetworkHandler::new(vec![
+            MockResponse::new(servfail_ip, &query_name, RecordType::A),
+            MockResponse::new(trunc_ip, &query_name, RecordType::A)
+                .a(&query_name, Ipv4Addr::new(93, 188, 44, 50)),
+        ])
+        .with_mutation(Box::new(move |ip, _, message| {
+            if ip == servfail_ip {
+                message.answers.clear();
+                message.metadata.response_code = ResponseCode::ServFail;
+            } else {
+                message.metadata.truncation = true;
+            }
+        }));
+        let provider = MockProvider::new(handler);
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+        let pool = NameServerPool::from_config(
+            [
+                NameServerConfig::udp(servfail_ip),
+                NameServerConfig::udp(trunc_ip),
+            ],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+            provider.clone(),
+        );
+
+        let err = pool
+            .lookup(
+                Query::new(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+            ),
+            "expected ServFail to be preserved over Truncated, got {err:?}"
+        );
+        assert!(!provider.queries(&trunc_ip).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pool_deadline_checks_exhaustion_first() {
+        subscribe();
+
+        let fast_ip = IpAddr::from([10, 0, 0, 1]);
+        let slow_ip = IpAddr::from([10, 0, 0, 2]);
+        let unreached_ip = IpAddr::from([10, 0, 0, 3]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        // Exhausted pool whose final server finishes past the deadline keeps the observed error.
+        let handler = MockNetworkHandler::new(vec![
+            MockResponse::new(fast_ip, &query_name, RecordType::A),
+            MockResponse::new(slow_ip, &query_name, RecordType::A),
+        ])
+        .with_mutation(Box::new(|_, _, message| {
+            message.answers.clear();
+            message.metadata.response_code = ResponseCode::ServFail;
+        }));
+        let provider = MockProvider::new(handler);
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            timeout: Duration::from_millis(50),
+            ..ResolverOpts::default()
+        };
+        let s1 = Arc::new(NameServer::new(
+            [],
+            NameServerConfig::udp(fast_ip),
+            &opts,
+            DelayedBindProvider::new(provider.clone(), Duration::ZERO),
+        ));
+        let s2 = Arc::new(NameServer::new(
+            [],
+            NameServerConfig::udp(slow_ip),
+            &opts,
+            DelayedBindProvider::new(provider, Duration::from_millis(120)),
+        ));
+        let pool = NameServerPool::from_nameservers(
+            vec![s1, s2],
+            Arc::new(PoolContext::new(opts.clone(), TlsConfig::new().unwrap())),
+        );
+        let err = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
+            ),
+            "expected ServFail for exhausted pool past deadline, got {err:?}"
+        );
+
+        // Unexhausted pool aborted at the deadline returns Timeout rather than an untrusted NXDomain.
+        let handler = MockNetworkHandler::new(vec![
+            MockResponse::new(fast_ip, &query_name, RecordType::A),
+            MockResponse::new(slow_ip, &query_name, RecordType::A),
+            MockResponse::new(unreached_ip, &query_name, RecordType::A)
+                .a(&query_name, Ipv4Addr::new(93, 188, 44, 50)),
+        ])
+        .with_mutation(Box::new(move |ip, _, message| {
+            if ip == fast_ip {
+                message.answers.clear();
+                message.metadata.response_code = ResponseCode::NXDomain;
+            } else if ip == slow_ip {
+                message.answers.clear();
+                message.metadata.response_code = ResponseCode::ServFail;
+            }
+        }));
+        let provider = MockProvider::new(handler);
+        let mut fast_cfg = NameServerConfig::udp(fast_ip);
+        fast_cfg.trust_negative_responses = false;
+        let s1 = Arc::new(NameServer::new(
+            [],
+            fast_cfg,
+            &opts,
+            DelayedBindProvider::new(provider.clone(), Duration::ZERO),
+        ));
+        let s2 = Arc::new(NameServer::new(
+            [],
+            NameServerConfig::udp(slow_ip),
+            &opts,
+            DelayedBindProvider::new(provider.clone(), Duration::from_millis(120)),
+        ));
+        let s3 = Arc::new(NameServer::new(
+            [],
+            NameServerConfig::udp(unreached_ip),
+            &opts,
+            DelayedBindProvider::new(provider.clone(), Duration::ZERO),
+        ));
+        let pool = NameServerPool::from_nameservers(
+            vec![s1, s2, s3],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+        let err = pool
+            .lookup(
+                Query::new(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, NetError::Timeout),
+            "expected Timeout when unattempted servers remain, got {err:?}"
+        );
+        assert!(provider.queries(&unreached_ip).is_empty());
     }
 }
